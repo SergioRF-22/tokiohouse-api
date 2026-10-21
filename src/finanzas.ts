@@ -27,10 +27,10 @@ type GastoFijo = {
   trabajo: 0 | 1
 }
 
-const fail = (status: 400 | 404 | 409, message: string) =>
+export const fail = (status: 400 | 404 | 409, message: string) =>
   new HTTPException(status, { res: Response.json({ error: message }, { status }) })
 
-function parseId(raw: string): number {
+export function parseId(raw: string): number {
   const id = Number(raw)
   if (!Number.isSafeInteger(id) || id <= 0) throw fail(400, 'Id no válido')
   return id
@@ -40,13 +40,13 @@ const isTipo = (v: unknown): v is Tipo => v === 'ingreso' || v === 'gasto'
 
 // "Hoy" en la zona del usuario, no la del servidor (el contenedor va en UTC).
 const hoyFmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit' })
-const hoy = () => hoyFmt.format(new Date())
+export const hoy = () => hoyFmt.format(new Date())
 
-const isFecha = (v: unknown): v is string =>
+export const isFecha = (v: unknown): v is string =>
   typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v
-const isMes = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(v)
+export const isMes = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(v)
 
-function siguienteMes(mes: string): string {
+export function siguienteMes(mes: string): string {
   const y = Number(mes.slice(0, 4))
   const m = Number(mes.slice(5, 7))
   return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`
@@ -65,7 +65,7 @@ function rango(desdeQ: string | undefined, hastaQ: string | undefined): [string,
 // ?trabajo=1 deja solo lo de trabajo (trabajo >= 1); sin él, trabajo >= 0 es todo.
 const soloTrabajo = (q: string | undefined) => (q === '1' ? 1 : 0)
 
-const ultimoDia =(mes: string) => new Date(Date.UTC(Number(mes.slice(0, 4)), Number(mes.slice(5, 7)), 0)).toISOString().slice(0, 10)
+export const ultimoDia = (mes: string) => new Date(Date.UTC(Number(mes.slice(0, 4)), Number(mes.slice(5, 7)), 0)).toISOString().slice(0, 10)
 
 // Crea los movimientos que falten de cada gasto fijo: desde su mes de inicio hasta el mes
 // actual, sin pasar de hoy ni de su baja. generado_hasta evita recrear los que se borraron;
@@ -294,4 +294,45 @@ finanzas.get('/resumen', (c) => {
     .all(...args)
 
   return c.json({ desde, hasta, por_mes, por_categoria, gastos_por_dia })
+})
+
+// --- Aportar a la casa ---
+
+// Gasto personal (categoría "Casa") + ingreso en casa (Aportación), enlazados; borrar uno borra el otro.
+finanzas.post('/aportar-casa', async (c) => {
+  const user = c.get('user')
+  const body = await c.req.json().catch(() => null)
+  const importe = body?.importe_centimos
+  if (!Number.isSafeInteger(importe) || importe <= 0) throw fail(400, 'El importe debe ser un entero de céntimos mayor que 0')
+  const fecha = body.fecha ?? hoy()
+  if (!isFecha(fecha)) throw fail(400, 'fecha debe ser YYYY-MM-DD')
+  const nota = typeof body.nota === 'string' ? body.nota.trim() : ''
+  if (nota.length > 200) throw fail(400, 'La nota admite hasta 200 caracteres')
+
+  db.exec('BEGIN')
+  try {
+    db.prepare("INSERT OR IGNORE INTO fin_categorias (user_id, tipo, nombre) VALUES (?, 'gasto', 'Casa')").run(user.id)
+    const cat = db
+      .prepare("SELECT id FROM fin_categorias WHERE user_id = ? AND tipo = 'gasto' AND nombre = 'Casa'")
+      .get(user.id) as { id: number }
+    const personal = db
+      .prepare(
+        `INSERT INTO fin_movimientos (user_id, tipo, importe_centimos, categoria_id, fecha, nota)
+         VALUES (?, 'gasto', ?, ?, ?, ?) RETURNING id`,
+      )
+      .get(user.id, importe, cat.id, fecha, nota || null) as { id: number }
+    db.prepare("INSERT OR IGNORE INTO casa_categorias (tipo, nombre) VALUES ('ingreso', 'Aportación')").run()
+    const aport = db.prepare("SELECT id FROM casa_categorias WHERE tipo = 'ingreso' AND nombre = 'Aportación'").get() as { id: number }
+    const casa = db
+      .prepare(
+        `INSERT INTO casa_movimientos (tipo, importe_centimos, categoria_id, fecha, nota, usuario_id, movimiento_personal_id)
+         VALUES ('ingreso', ?, ?, ?, ?, ?, ?) RETURNING id`,
+      )
+      .get(importe, aport.id, fecha, nota || null, user.id, personal.id) as { id: number }
+    db.exec('COMMIT')
+    return c.json({ movimiento_personal_id: personal.id, movimiento_casa_id: casa.id }, 201)
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
 })
