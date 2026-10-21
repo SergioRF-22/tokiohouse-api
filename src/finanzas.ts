@@ -14,6 +14,7 @@ type Movimiento = {
   fecha: string
   nota: string | null
   gasto_fijo_id: number | null
+  trabajo: 0 | 1
 }
 type GastoFijo = {
   id: number
@@ -23,6 +24,7 @@ type GastoFijo = {
   categoria: string
   dia: number
   mes_inicio: string
+  trabajo: 0 | 1
 }
 
 const fail = (status: 400 | 404 | 409, message: string) =>
@@ -60,7 +62,10 @@ function rango(desdeQ: string | undefined, hastaQ: string | undefined): [string,
   return [desde, hasta]
 }
 
-const ultimoDia = (mes: string) => new Date(Date.UTC(Number(mes.slice(0, 4)), Number(mes.slice(5, 7)), 0)).toISOString().slice(0, 10)
+// ?trabajo=1 deja solo lo de trabajo (trabajo >= 1); sin él, trabajo >= 0 es todo.
+const soloTrabajo = (q: string | undefined) => (q === '1' ? 1 : 0)
+
+const ultimoDia =(mes: string) => new Date(Date.UTC(Number(mes.slice(0, 4)), Number(mes.slice(5, 7)), 0)).toISOString().slice(0, 10)
 
 // Crea los movimientos que falten de cada gasto fijo: desde su mes de inicio hasta el mes
 // actual, sin pasar de hoy ni de su baja. generado_hasta evita recrear los que se borraron;
@@ -70,7 +75,7 @@ function materializar(userId: number) {
   const mesActual = fechaHoy.slice(0, 7)
   const fijos = db
     .prepare(
-      `SELECT id, nombre, importe_centimos, categoria_id, dia, mes_inicio, baja, generado_hasta
+      `SELECT id, nombre, importe_centimos, categoria_id, dia, mes_inicio, baja, generado_hasta, trabajo
        FROM fin_gastos_fijos
        WHERE user_id = ? AND (generado_hasta IS NULL OR generado_hasta < ?)`,
     )
@@ -81,14 +86,15 @@ function materializar(userId: number) {
     categoria_id: number
     dia: number
     mes_inicio: string
+    trabajo: number
     baja: string | null
     generado_hasta: string | null
   }[]
   if (fijos.length === 0) return
 
   const ins = db.prepare(
-    `INSERT OR IGNORE INTO fin_movimientos (user_id, tipo, importe_centimos, categoria_id, fecha, nota, gasto_fijo_id)
-     VALUES (?, 'gasto', ?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO fin_movimientos (user_id, tipo, importe_centimos, categoria_id, fecha, nota, gasto_fijo_id, trabajo)
+     VALUES (?, 'gasto', ?, ?, ?, ?, ?, ?)`,
   )
   const upd = db.prepare('UPDATE fin_gastos_fijos SET generado_hasta = ? WHERE id = ?')
   db.exec('BEGIN')
@@ -99,7 +105,7 @@ function materializar(userId: number) {
       for (; mes <= mesActual; mes = siguienteMes(mes)) {
         const fecha = `${mes}-${String(f.dia).padStart(2, '0')}`
         if (fecha > fechaHoy || (f.baja !== null && fecha >= f.baja)) break
-        ins.run(userId, f.importe_centimos, f.categoria_id, fecha, f.nombre, f.id)
+        ins.run(userId, f.importe_centimos, f.categoria_id, fecha, f.nombre, f.id, f.trabajo)
         hasta = mes
       }
       if (hasta !== f.generado_hasta) upd.run(hasta, f.id)
@@ -151,7 +157,7 @@ finanzas.post('/categorias', async (c) => {
 
 // --- Movimientos ---
 
-const MOV_SELECT = `SELECT m.id, m.tipo, m.importe_centimos, m.categoria_id, k.nombre AS categoria, m.fecha, m.nota, m.gasto_fijo_id
+const MOV_SELECT = `SELECT m.id, m.tipo, m.importe_centimos, m.categoria_id, k.nombre AS categoria, m.fecha, m.nota, m.gasto_fijo_id, m.trabajo
   FROM fin_movimientos m JOIN fin_categorias k ON k.id = m.categoria_id`
 
 finanzas.get('/movimientos', (c) => {
@@ -159,8 +165,8 @@ finanzas.get('/movimientos', (c) => {
   const [desde, hasta] = rango(c.req.query('desde'), c.req.query('hasta'))
   materializar(user.id)
   const movimientos = db
-    .prepare(`${MOV_SELECT} WHERE m.user_id = ? AND m.fecha BETWEEN ? AND ? ORDER BY m.fecha DESC, m.id DESC`)
-    .all(user.id, desde, hasta) as Movimiento[]
+    .prepare(`${MOV_SELECT} WHERE m.user_id = ? AND m.fecha BETWEEN ? AND ? AND m.trabajo >= ? ORDER BY m.fecha DESC, m.id DESC`)
+    .all(user.id, desde, hasta, soloTrabajo(c.req.query('trabajo'))) as Movimiento[]
   return c.json({ movimientos })
 })
 
@@ -176,6 +182,7 @@ finanzas.post('/movimientos', async (c) => {
   if (!isFecha(fecha)) throw fail(400, 'fecha debe ser YYYY-MM-DD')
   const nota = typeof body.nota === 'string' ? body.nota.trim() : ''
   if (nota.length > 200) throw fail(400, 'La nota admite hasta 200 caracteres')
+  if (body.trabajo !== undefined && typeof body.trabajo !== 'boolean') throw fail(400, 'trabajo debe ser booleano')
   const fijoId = body.gasto_fijo_id ?? null
   if (fijoId !== null) {
     const ok = Number.isSafeInteger(fijoId) && db.prepare('SELECT 1 FROM fin_gastos_fijos WHERE id = ? AND user_id = ?').get(fijoId, user.id)
@@ -186,10 +193,10 @@ finanzas.post('/movimientos', async (c) => {
   try {
     const { id } = db
       .prepare(
-        `INSERT INTO fin_movimientos (user_id, tipo, importe_centimos, categoria_id, fecha, nota, gasto_fijo_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+        `INSERT INTO fin_movimientos (user_id, tipo, importe_centimos, categoria_id, fecha, nota, gasto_fijo_id, trabajo)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
       )
-      .get(user.id, body.tipo, importe, cat.id, fecha, nota || null, fijoId) as { id: number }
+      .get(user.id, body.tipo, importe, cat.id, fecha, nota || null, fijoId, body.trabajo ? 1 : 0) as { id: number }
     return c.json(db.prepare(`${MOV_SELECT} WHERE m.id = ?`).get(id) as Movimiento, 201)
   } catch (e) {
     if (e instanceof Error && /UNIQUE/.test(e.message)) throw fail(409, 'Ese gasto fijo ya tiene movimiento en ese mes')
@@ -207,7 +214,7 @@ finanzas.delete('/movimientos/:id', (c) => {
 
 // --- Gastos fijos ---
 
-const FIJO_SELECT = `SELECT g.id, g.nombre, g.importe_centimos, g.categoria_id, k.nombre AS categoria, g.dia, g.mes_inicio
+const FIJO_SELECT = `SELECT g.id, g.nombre, g.importe_centimos, g.categoria_id, k.nombre AS categoria, g.dia, g.mes_inicio, g.trabajo
   FROM fin_gastos_fijos g JOIN fin_categorias k ON k.id = g.categoria_id`
 
 finanzas.get('/gastos-fijos', (c) => {
@@ -230,13 +237,14 @@ finanzas.post('/gastos-fijos', async (c) => {
   if (!Number.isInteger(dia) || dia < 1 || dia > 28) throw fail(400, 'El día debe estar entre 1 y 28')
   const mesInicio = body.mes_inicio ?? hoy().slice(0, 7)
   if (!isMes(mesInicio)) throw fail(400, 'mes_inicio debe ser YYYY-MM')
+  if (body.trabajo !== undefined && typeof body.trabajo !== 'boolean') throw fail(400, 'trabajo debe ser booleano')
 
   const { id } = db
     .prepare(
-      `INSERT INTO fin_gastos_fijos (user_id, nombre, importe_centimos, categoria_id, dia, mes_inicio)
-       VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
+      `INSERT INTO fin_gastos_fijos (user_id, nombre, importe_centimos, categoria_id, dia, mes_inicio, trabajo)
+       VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
     )
-    .get(user.id, nombre, importe, cat.id, dia, mesInicio) as { id: number }
+    .get(user.id, nombre, importe, cat.id, dia, mesInicio, body.trabajo ? 1 : 0) as { id: number }
   return c.json(db.prepare(`${FIJO_SELECT} WHERE g.id = ?`).get(id) as GastoFijo, 201)
 })
 
@@ -258,14 +266,14 @@ finanzas.get('/resumen', (c) => {
   const user = c.get('user')
   const [desde, hasta] = rango(c.req.query('desde'), c.req.query('hasta'))
   materializar(user.id)
-  const args = [user.id, desde, hasta]
+  const args = [user.id, desde, hasta, soloTrabajo(c.req.query('trabajo'))]
 
   const por_mes = db
     .prepare(
       `SELECT mes,
               COALESCE(SUM(CASE WHEN tipo = 'ingreso' THEN importe_centimos END), 0) AS ingresos,
               COALESCE(SUM(CASE WHEN tipo = 'gasto' THEN importe_centimos END), 0) AS gastos
-       FROM fin_movimientos WHERE user_id = ? AND fecha BETWEEN ? AND ?
+       FROM fin_movimientos WHERE user_id = ? AND fecha BETWEEN ? AND ? AND trabajo >= ?
        GROUP BY mes ORDER BY mes`,
     )
     .all(...args)
@@ -273,14 +281,14 @@ finanzas.get('/resumen', (c) => {
     .prepare(
       `SELECT m.tipo, m.categoria_id, k.nombre AS categoria, SUM(m.importe_centimos) AS total
        FROM fin_movimientos m JOIN fin_categorias k ON k.id = m.categoria_id
-       WHERE m.user_id = ? AND m.fecha BETWEEN ? AND ?
+       WHERE m.user_id = ? AND m.fecha BETWEEN ? AND ? AND m.trabajo >= ?
        GROUP BY m.tipo, m.categoria_id ORDER BY m.tipo, total DESC`,
     )
     .all(...args)
   const gastos_por_dia = db
     .prepare(
       `SELECT fecha, SUM(importe_centimos) AS total
-       FROM fin_movimientos WHERE user_id = ? AND tipo = 'gasto' AND fecha BETWEEN ? AND ?
+       FROM fin_movimientos WHERE user_id = ? AND tipo = 'gasto' AND fecha BETWEEN ? AND ? AND trabajo >= ?
        GROUP BY fecha ORDER BY fecha`,
     )
     .all(...args)
