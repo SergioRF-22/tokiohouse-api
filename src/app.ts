@@ -4,6 +4,7 @@ import { csrf } from 'hono/csrf'
 import { HTTPException } from 'hono/http-exception'
 import { logger } from 'hono/logger'
 import { auth, requireSession, type AppEnv } from './auth.ts'
+import { finanzas } from './finanzas.ts'
 import { shopping } from './shopping.ts'
 import { tasks } from './tasks.ts'
 
@@ -20,6 +21,7 @@ app.get('/health', (c) => c.json({ ok: true }))
 app.route('/auth', auth)
 app.route('/shopping', shopping)
 app.route('/tasks', tasks)
+app.route('/finanzas', finanzas)
 
 app.onError((err, c) => {
   if (err instanceof HTTPException) return err.getResponse()
