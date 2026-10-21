@@ -14,8 +14,8 @@ export const CATEGORIAS = [
   'Otro',
 ] as const
 
-type Item = { id: number; nombre: string; categoria: string; en_bolsa: boolean; posicion: number | null }
-type Row = { id: number; nombre: string; categoria: string; en_bolsa: number; posicion: number | null }
+type Item = { id: number; nombre: string; categoria: string; en_bolsa: boolean; posicion: number | null; comprado: boolean }
+type Row = { id: number; nombre: string; categoria: string; en_bolsa: number; posicion: number | null; comprado: number }
 
 const toItem = (r: Row): Item => ({
   id: r.id,
@@ -23,6 +23,7 @@ const toItem = (r: Row): Item => ({
   categoria: r.categoria,
   en_bolsa: r.en_bolsa === 1,
   posicion: r.posicion,
+  comprado: r.comprado === 1,
 })
 
 const fail = (status: 400 | 404, message: string) =>
@@ -110,9 +111,41 @@ shopping.post('/:id/lista', (c) => {
 shopping.delete('/:id/lista', (c) => {
   const row = find(parseId(c.req.param('id')))
   if (!row) throw fail(404, 'No existe')
-  if (row.en_bolsa) db.prepare('UPDATE shopping_items SET posicion = NULL WHERE id = ?').run(row.id)
+  if (row.en_bolsa) db.prepare('UPDATE shopping_items SET posicion = NULL, comprado = 0 WHERE id = ?').run(row.id)
   else db.prepare('DELETE FROM shopping_items WHERE id = ?').run(row.id)
   return c.body(null, 204)
+})
+
+// Marca o desmarca como comprado (tachado) un producto de la lista.
+shopping.put('/:id/comprado', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  if (typeof body?.comprado !== 'boolean') throw fail(400, 'comprado debe ser booleano')
+  const row = db
+    .prepare('UPDATE shopping_items SET comprado = ? WHERE id = ? AND posicion IS NOT NULL RETURNING *')
+    .get(body.comprado ? 1 : 0, parseId(c.req.param('id'))) as Row | undefined
+  if (!row) throw fail(404, 'No está en la lista')
+  return c.json(toItem(row))
+})
+
+// Pasa un producto a la bolsa: sale de la lista y se marca en_bolsa (idempotente).
+shopping.post('/:id/bolsa', (c) => {
+  const row = db
+    .prepare('UPDATE shopping_items SET en_bolsa = 1, posicion = NULL, comprado = 0 WHERE id = ? RETURNING *')
+    .get(parseId(c.req.param('id'))) as Row | undefined
+  if (!row) throw fail(404, 'No existe')
+  return c.json(toItem(row))
+})
+
+// Cierra la compra: los tachados salen de la lista, a la bolsa o borrados del todo.
+shopping.post('/lista/terminar', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  if (body?.accion !== 'bolsa' && body?.accion !== 'eliminar') throw fail(400, "accion debe ser 'bolsa' o 'eliminar'")
+  const sql =
+    body.accion === 'bolsa'
+      ? 'UPDATE shopping_items SET en_bolsa = 1, posicion = NULL, comprado = 0 WHERE comprado = 1 AND posicion IS NOT NULL'
+      : 'DELETE FROM shopping_items WHERE comprado = 1 AND posicion IS NOT NULL'
+  const { changes } = db.prepare(sql).run()
+  return c.json({ afectados: Number(changes) })
 })
 
 // Borra del todo: sale de la bolsa y de la lista.
